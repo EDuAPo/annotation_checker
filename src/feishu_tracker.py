@@ -70,11 +70,12 @@ class FeishuTracker:
         # 字段名标准化映射（支持常用别名自动适配）
         self._field_alias = {
             "名称": ["名称", "数据包名称", "name"],
-            "关键帧数量": ["关键帧数量", "关键帧数", "keyframe", "key_frame"],
-            "拉框": ["拉框", "拉框属性"],
-            "线段": ["线段", "线段属性"],
-            "贴边": ["贴边", "贴边属性"],
-            "盲区": ["盲区", "盲区属性"],
+            "关键帧数": ["关键帧数量", "关键帧数", "keyframe", "key_frame"],
+            "标注情况": ["标注情况"],
+            "拉框属性": ["拉框", "拉框属性"],
+            "线段属性": ["线段", "线段属性"],
+            "贴边属性": ["贴边", "贴边属性"],
+            "盲区属性": ["盲区", "盲区属性"],
             "更新时间": ["更新时间"],
         }
         
@@ -270,8 +271,14 @@ class FeishuTracker:
         if not self.field_mapping:
             self.get_fields(table_id)
         
-        # 获取名称字段 ID
-        name_field_id = self.field_mapping.get("名称") or self.field_mapping.get("name") or self.field_mapping.get("数据名称")
+        # 获取名称字段
+        name_field_name = None
+        name_field_id = None
+        for field_name in self.field_mapping:
+            if field_name in ["名称", "数据包名称", "name", "Name"]:
+                name_field_name = field_name
+                name_field_id = self.field_mapping[field_name]
+                break
         if not name_field_id:
             # 尝试使用第一个文本字段
             logger.warning("未找到名称字段，将尝试获取所有记录进行匹配")
@@ -288,7 +295,7 @@ class FeishuTracker:
                 "conjunction": "and",
                 "conditions": [
                     {
-                        "field_name": "名称",  # 使用字段名而非 ID
+                        "field_name": name_field_name,  # 使用正确的字段名
                         "operator": "is",
                         "value": [name]
                     }
@@ -326,14 +333,15 @@ class FeishuTracker:
                 for item in items:
                     fields = item.get("fields", {})
                     # 检查各种可能的名称字段
-                    for field_name in ["名称", "name", "数据名称", "Name"]:
-                        field_value = fields.get(field_name)
-                        if field_value:
-                            # 处理不同类型的字段值
-                            if isinstance(field_value, str) and name in field_value:
-                                return item
-                            elif isinstance(field_value, list) and any(name in str(v) for v in field_value):
-                                return item
+                    for field_name in self.field_mapping:
+                        if field_name in ["名称", "数据包名称", "name", "Name"]:
+                            field_value = fields.get(field_name)
+                            if field_value:
+                                # 处理不同类型的字段值
+                                if isinstance(field_value, str) and name in field_value:
+                                    return item
+                                elif isinstance(field_value, list) and any(name in str(v) for v in field_value):
+                                    return item
                 return None
         except Exception as e:
             logger.error(f"遍历查找失败: {e}")
@@ -362,41 +370,33 @@ class FeishuTracker:
         
         url = f"{self.api_base}/bitable/v1/apps/{self.app_token}/tables/{table_id}/records"
         
-        # 构建记录数据，全部用 field_id 作为 key
+        # 构建记录数据，全部用 field_name 作为 key
         fields = {}
         # 名称
-        name_id = self._get_field_id_by_alias("名称")
-        if name_id:
-            fields[name_id] = name
-        # 更新时间
-        update_id = self._get_field_id_by_alias("更新时间")
-        if update_id:
-            fields[update_id] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        name_field = self._get_field_name_by_alias("名称")
+        if name_field:
+            fields[name_field] = name
+        # 更新时间（必须为Unix时间戳）
+        update_field = self._get_field_name_by_alias("更新时间")
+        if update_field:
+            fields[update_field] = int(time.time())
         # 属性复选框
         for attr in attributes:
-            attr_id = self._get_field_id_by_alias(attr)
-            if attr_id:
-                fields[attr_id] = True
+            attr_field = self._get_field_name_by_alias(attr)
+            if attr_field:
+                fields[attr_field] = True
         # 额外字段（如关键帧数量）
         if extra_fields:
             for k, v in extra_fields.items():
-                k_id = self._get_field_id_by_alias(k)
-                if k_id:
-                    fields[k_id] = v
+                k_field = self._get_field_name_by_alias(k)
+                # 针对关键帧数等字段做类型适配
+                if k_field:
+                    if k in ["关键帧数", "关键帧数量", "keyframe", "key_frame"]:
+                        fields[k_field] = str(v)
+                    else:
+                        fields[k_field] = v
         payload = {"fields": fields}
 
-    def _get_field_id_by_alias(self, name: str) -> str:
-        """
-        根据字段名或别名获取 field_id
-        """
-        for std, aliases in self._field_alias.items():
-            if name == std or name in aliases:
-                for alias in aliases:
-                    if alias in self.field_mapping and self.field_mapping[alias]:
-                        return self.field_mapping[alias]
-        # 直接查找
-        return self.field_mapping.get(name, "")
-        
         try:
             response = requests.post(url, headers=self._get_headers(), json=payload, timeout=10)
             data = response.json()
@@ -408,10 +408,24 @@ class FeishuTracker:
             else:
                 logger.error(f"创建记录失败: {data}")
                 return None
-        except requests.RequestException as e:
+        except Exception as e:
             logger.error(f"创建记录请求失败: {e}")
             return None
-    
+    def _get_field_name_by_alias(self, name: str) -> str:
+        """
+        根据字段名或别名获取实际存在的字段名
+        """
+        for std, aliases in self._field_alias.items():
+            if name == std or name in aliases:
+                for alias in aliases:
+                    if alias in self.field_mapping:
+                        return alias
+        # 直接查找
+        for field_name in self.field_mapping:
+            if field_name == name:
+                return field_name
+        return ""
+        
     def update_record(self, record_id: str, attributes: List[str], table_id: str = None, extra_fields: Dict[str, Any] = None) -> bool:
         """
         更新记录的属性字段
@@ -432,18 +446,25 @@ class FeishuTracker:
         url = f"{self.api_base}/bitable/v1/apps/{self.app_token}/tables/{table_id}/records/{record_id}"
         
         # 构建更新数据
-        fields = {
-            "更新时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        
+        fields = {}
+        # 更新时间（必须为Unix时间戳）
+        update_field = self._get_field_name_by_alias("更新时间")
+        if update_field:
+            fields[update_field] = int(time.time())
         # 设置属性字段为勾选状态
         for attr in attributes:
-            fields[attr] = True
-        
+            attr_field = self._get_field_name_by_alias(attr)
+            if attr_field:
+                fields[attr_field] = True
         # 添加额外字段（如关键帧数量）
         if extra_fields:
-            fields.update(extra_fields)
-        
+            for k, v in extra_fields.items():
+                k_field = self._get_field_name_by_alias(k)
+                if k_field:
+                    if k in ["关键帧数", "关键帧数量", "keyframe", "key_frame"]:
+                        fields[k_field] = str(v)
+                    else:
+                        fields[k_field] = v
         payload = {"fields": fields}
         
         try:

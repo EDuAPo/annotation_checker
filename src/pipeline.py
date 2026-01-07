@@ -204,11 +204,11 @@ class AnnotationPipeline:
         if not FEISHU_AVAILABLE:
             logger.debug("飞书追踪模块未加载")
             return
-        
         try:
             self.feishu_tracker = FeishuTracker()
             # 检测数据属性
             attrs = self.feishu_tracker.detect_attributes(str(self.json_dir))
+            self.detected_attributes = attrs  # 修正：赋值给实例属性，供后续统计使用
             if attrs:
                 logger.info(f"🔗 飞书追踪已启用，检测到属性: {', '.join(attrs)}")
             else:
@@ -218,10 +218,11 @@ class AnnotationPipeline:
             self.feishu_tracker = None
     
     def _update_feishu_tracking(self):
-        """更新飞书表格追踪信息"""
-        if not self.feishu_tracker:
-            return
-        
+        """更新飞书表格追踪信息或本地TXT统计"""
+        import yaml
+        with open("configs/feishu_config.yaml", "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        feishu_enabled = config.get("enabled", True)
         # 收集所有处理过的数据名称
         all_names = set()
         all_names.update(self.results.get('downloaded', []))
@@ -229,20 +230,35 @@ class AnnotationPipeline:
         all_names.update(self.results.get('processed', []))
         all_names.update(self.results.get('check_passed', []))
         all_names.update(self.results.get('moved_to_final', []))
-        
         if not all_names:
-            logger.info("没有需要更新到飞书的数据")
+            logger.info("没有需要统计的数据")
             return
-        
         # 构建数据信息（包含关键帧数量）
         data_info = {}
         for name in all_names:
-            info = {}
+            info = {
+                "标注情况": ["已完成"]  # 多选字段，需要列表
+            }
             if name in self.keyframe_counts:
-                info["关键帧数量"] = self.keyframe_counts[name]
-            if info:
-                data_info[name] = info
-        
+                info["关键帧数"] = self.keyframe_counts[name]
+            data_info[name] = info
+        if not feishu_enabled:
+            # 本地TXT统计
+            from src.local_tracker import write_txt_report
+            local_records = []
+            for name in all_names:
+                rec = {"数据包名称": name}
+                rec.update(data_info.get(name, {}))
+                # 属性复选框
+                for attr in getattr(self, 'detected_attributes', []):
+                    rec[attr] = 1
+                local_records.append(rec)
+            write_txt_report(local_records)
+            logger.info(f"✓ 已写入本地统计 TXT: local_report.txt")
+            return
+        if not self.feishu_tracker:
+            logger.info("没有需要更新到飞书的数据")
+            return
         try:
             keyframes_msg = f"，包含 {len(data_info)} 个关键帧统计" if data_info else ""
             logger.info(f"📊 正在更新飞书表格 ({len(all_names)} 条数据{keyframes_msg})...")
@@ -251,14 +267,12 @@ class AnnotationPipeline:
                 str(self.json_dir),
                 data_info=data_info
             )
-            
             if self.feishu_result:
                 created = len(self.feishu_result.get('created', []))
                 updated = len(self.feishu_result.get('updated', []))
                 failed = len(self.feishu_result.get('failed', []))
                 attrs = self.feishu_result.get('attributes', [])
                 total_keyframes = self.feishu_result.get('total_keyframes', 0)
-                
                 if created > 0 or updated > 0:
                     keyframes_info = f", 总关键帧 {total_keyframes}" if total_keyframes > 0 else ""
                     logger.info(f"✓ 飞书表格更新成功: 新增 {created}, 更新 {updated}, 属性 {attrs}{keyframes_info}")
