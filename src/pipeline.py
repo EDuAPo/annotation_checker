@@ -962,28 +962,35 @@ if __name__ == "__main__":
             logger.debug(f"获取关键帧数量失败: {e}")
             return 0
     
-    def _get_keyframe_count_remote_threaded(self, ssh, remote_dir: str) -> int:
-        """线程安全版本：从远程服务器获取关键帧数量 (读取 sample.json)"""
-        try:
-            sample_paths = [
-                f"{remote_dir}/sample.json",
-                f"{remote_dir}/undistorted/sample.json",
-            ]
-            
-            for sample_path in sample_paths:
-                # 更简单可靠的方法：先检查文件存在，然后读取并计数
-                status, out, _ = self._exec_remote_thread(ssh, f"test -f '{sample_path}' && echo 'exists'")
-                if status == 0 and 'exists' in out:
-                    # 文件存在，尝试读取
-                    status, out, _ = self._exec_remote_thread(ssh, f"python3 -c \"import json; print(len(json.load(open('{sample_path}')))\"")
-                    if status == 0 and out.strip().isdigit():
-                        count = int(out.strip())
-                        logger.debug(f"从 {sample_path} 获取到 {count} 个关键帧")
-                        return count
-            
-            return 0
-        except Exception as e:
-            return 0
+    def _get_keyframe_count_remote_threaded(self, ssh, remote_dir: str, max_retries: int = 2) -> int:
+        """线程安全版本：从远程服务器获取关键帧数量 (读取 sample.json)，支持重试"""
+        for attempt in range(max_retries + 1):
+            try:
+                sample_paths = [
+                    f"{remote_dir}/sample.json",
+                    f"{remote_dir}/undistorted/sample.json",
+                ]
+                
+                for sample_path in sample_paths:
+                    # 更简单可靠的方法：先检查文件存在，然后读取并计数
+                    status, out, _ = self._exec_remote_thread(ssh, f"test -f '{sample_path}' && echo 'exists'")
+                    if status == 0 and 'exists' in out:
+                        # 文件存在，尝试读取
+                        status, out, _ = self._exec_remote_thread(ssh, f"python3 -c \"import json; print(len(json.load(open('{sample_path}')))\" 2>/dev/null")
+                        if status == 0 and out.strip().isdigit():
+                            count = int(out.strip())
+                            logger.debug(f"从 {sample_path} 获取到 {count} 个关键帧")
+                            return count
+                
+                return 0
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.debug(f"获取关键帧数量失败 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
+                    import time
+                    time.sleep(0.5 * (attempt + 1))  # 递增延迟
+                    continue
+                logger.debug(f"获取关键帧数量最终失败: {e}")
+                return 0
     
     def _deploy_checker_script(self):
         """部署检查脚本到服务器"""
@@ -2003,20 +2010,16 @@ if __name__ == "__main__":
             if check_passed:
                 with results_lock:
                     self.results['check_passed'].append(stem)
-            else:
-                with results_lock:
-                    self.results['check_failed'].append(stem)
-            
-            # 获取关键帧数量（所有处理完成的数据都要统计）
-            keyframe_count = self._get_keyframe_count_remote_threaded(ssh, remote_data_dir)
-            if keyframe_count > 0:
-                with self.keyframe_counts_lock:
-                    self.keyframe_counts[stem] = keyframe_count
-                logger.info(f"  [统计] 📊 关键帧数量: {keyframe_count}")
-            else:
-                logger.warning(f"  [警告] 检查完成文件 {stem} 未能获取关键帧数量 (目录: {remote_data_dir})")
-            
-            if check_passed:
+                
+                # 获取关键帧数量（在移动之前，从processing目录获取）
+                keyframe_count = self._get_keyframe_count_remote_threaded(ssh, remote_data_dir)
+                if keyframe_count > 0:
+                    with self.keyframe_counts_lock:
+                        self.keyframe_counts[stem] = keyframe_count
+                    logger.info(f"  [统计] 📊 关键帧数量: {keyframe_count}")
+                else:
+                    logger.warning(f"  [警告] 检查完成文件 {stem} 未能获取关键帧数量 (目录: {remote_data_dir})")
+                
                 # ===== 步骤 5: 移动 =====
                 src = f"{SERVER_PROCESS_DIR}/{stem}"
                 dst = f"{SERVER_FINAL_DIR}/{stem}"
@@ -2042,6 +2045,15 @@ if __name__ == "__main__":
             else:
                 with results_lock:
                     self.results['check_failed'].append(stem)
+                
+                # 检查失败的数据也获取关键帧数量
+                keyframe_count = self._get_keyframe_count_remote_threaded(ssh, remote_data_dir)
+                if keyframe_count > 0:
+                    with self.keyframe_counts_lock:
+                        self.keyframe_counts[stem] = keyframe_count
+                    logger.info(f"  [统计] 📊 关键帧数量: {keyframe_count}")
+                else:
+                    logger.warning(f"  [警告] 检查失败文件 {stem} 未能获取关键帧数量 (目录: {remote_data_dir})")
             
             return check_passed
             
