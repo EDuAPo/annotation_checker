@@ -29,6 +29,13 @@ from datetime import datetime
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 飞书追踪模块 (可选)
+try:
+    from feishu_tracker import FeishuTracker
+    FEISHU_AVAILABLE = True
+except ImportError:
+    FEISHU_AVAILABLE = False
+
 # ================= 配置区域 =================
 # DataWeave API 配置
 API_BASE_URL = "https://dataweave.enableai.cn/api/v4"
@@ -56,9 +63,9 @@ AUTH_TOKEN = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYW
 # 服务器配置
 SERVER_IP = "222.223.112.212"
 SERVER_USER = "user"
-SERVER_ZIP_DIR = "/data01/rere_zips"                    # 上传 ZIP 的临时目录
-SERVER_PROCESS_DIR = "/data01/processing"  # 处理中的数据目录
-SERVER_FINAL_DIR = "/data01/dataset/scenesnew"         # 检查通过后的最终目录
+SERVER_ZIP_DIR = "/data02/rere_zips"                    # 上传 ZIP 的临时目录
+SERVER_PROCESS_DIR = "/data02/processing"  # 处理中的数据目录
+SERVER_FINAL_DIR = "/data02/test"         # 检查通过后的最终目录
 
 # 处理完成后对原始 ZIP 的操作方式
 # "rename": 重命名为 processed_xxx.zip (默认，标记已处理)
@@ -173,6 +180,10 @@ class AnnotationPipeline:
             'moved_to_final': []
         }
         
+        # 关键帧数量统计 {数据名称: 关键帧数量}
+        self.keyframe_counts = {}
+        self.keyframe_counts_lock = threading.Lock()
+        
         # 错误追踪 (用于追溯失败原因)
         self.errors = {}  # {stem: [(step, error_msg), ...]}
         self.errors_lock = threading.Lock()
@@ -182,6 +193,79 @@ class AnnotationPipeline:
         self._token_time = None
         self._token_lock = threading.Lock()
         self._token_max_age = 50 * 60  # Token 有效期 50 分钟 (服务端1小时过期)
+        
+        # 飞书追踪器
+        self.feishu_tracker = None
+        self.feishu_result = None  # 飞书更新结果
+        self._init_feishu_tracker()
+    
+    def _init_feishu_tracker(self):
+        """初始化飞书追踪器"""
+        if not FEISHU_AVAILABLE:
+            logger.debug("飞书追踪模块未加载")
+            return
+        
+        try:
+            self.feishu_tracker = FeishuTracker()
+            # 检测数据属性
+            attrs = self.feishu_tracker.detect_attributes(str(self.json_dir))
+            if attrs:
+                logger.info(f"🔗 飞书追踪已启用，检测到属性: {', '.join(attrs)}")
+            else:
+                logger.info("🔗 飞书追踪已启用 (未检测到特定属性)")
+        except Exception as e:
+            logger.warning(f"飞书追踪器初始化失败: {e}")
+            self.feishu_tracker = None
+    
+    def _update_feishu_tracking(self):
+        """更新飞书表格追踪信息"""
+        if not self.feishu_tracker:
+            return
+        
+        # 收集所有处理过的数据名称
+        all_names = set()
+        all_names.update(self.results.get('downloaded', []))
+        all_names.update(self.results.get('uploaded', []))
+        all_names.update(self.results.get('processed', []))
+        all_names.update(self.results.get('check_passed', []))
+        all_names.update(self.results.get('moved_to_final', []))
+        
+        if not all_names:
+            logger.info("没有需要更新到飞书的数据")
+            return
+        
+        # 构建数据信息（包含关键帧数量）
+        data_info = {}
+        for name in all_names:
+            info = {}
+            if name in self.keyframe_counts:
+                info["关键帧数量"] = self.keyframe_counts[name]
+            if info:
+                data_info[name] = info
+        
+        try:
+            keyframes_msg = f"，包含 {len(data_info)} 个关键帧统计" if data_info else ""
+            logger.info(f"📊 正在更新飞书表格 ({len(all_names)} 条数据{keyframes_msg})...")
+            self.feishu_result = self.feishu_tracker.track_data(
+                list(all_names), 
+                str(self.json_dir),
+                data_info=data_info
+            )
+            
+            if self.feishu_result:
+                created = len(self.feishu_result.get('created', []))
+                updated = len(self.feishu_result.get('updated', []))
+                failed = len(self.feishu_result.get('failed', []))
+                attrs = self.feishu_result.get('attributes', [])
+                total_keyframes = self.feishu_result.get('total_keyframes', 0)
+                
+                if created > 0 or updated > 0:
+                    keyframes_info = f", 总关键帧 {total_keyframes}" if total_keyframes > 0 else ""
+                    logger.info(f"✓ 飞书表格更新成功: 新增 {created}, 更新 {updated}, 属性 {attrs}{keyframes_info}")
+                if failed > 0:
+                    logger.warning(f"⚠ 飞书表格更新失败: {failed} 条")
+        except Exception as e:
+            logger.error(f"飞书表格更新失败: {e}")
     
     def _cleanup_incomplete_downloads(self):
         """清理不完整的下载文件（.tmp 临时文件）"""
@@ -456,34 +540,38 @@ class AnnotationPipeline:
         if not zip_files:
             logger.warning("没有找到 ZIP 文件需要上传")
             return
-        
-        logger.info(f"准备上传 {len(zip_files)} 个 ZIP 文件")
-        
-        for i, zip_file in enumerate(zip_files):
+
+        # 过滤掉服务器已存在的 zip 文件
+        files_to_upload = []
+        for zip_file in zip_files:
+            remote_path = f"{SERVER_ZIP_DIR}/{zip_file.name}"
+            try:
+                remote_stat = self.sftp.stat(remote_path)
+                if remote_stat.st_size == zip_file.stat().st_size:
+                    logger.info(f"远程已存在: {zip_file.name}，跳过上传")
+                    self.results['uploaded'].append(zip_file.stem)
+                    continue
+            except FileNotFoundError:
+                pass
+            files_to_upload.append(zip_file)
+
+        if not files_to_upload:
+            logger.info("所有 ZIP 文件服务器已存在，无需上传")
+            return
+
+        logger.info(f"准备上传 {len(files_to_upload)} 个 ZIP 文件")
+
+        for i, zip_file in enumerate(files_to_upload):
             remote_path = f"{SERVER_ZIP_DIR}/{zip_file.name}"
             file_size_mb = zip_file.stat().st_size / (1024 * 1024)
-            
-            logger.info(f"[{i+1}/{len(zip_files)}] 上传: {zip_file.name} ({file_size_mb:.1f} MB)")
-            
+            logger.info(f"[{i+1}/{len(files_to_upload)}] 上传: {zip_file.name} ({file_size_mb:.1f} MB)")
             try:
-                # 检查远程文件是否存在
-                try:
-                    remote_stat = self.sftp.stat(remote_path)
-                    if remote_stat.st_size == zip_file.stat().st_size:
-                        logger.info(f"    文件已存在，跳过")
-                        self.results['uploaded'].append(zip_file.stem)
-                        continue
-                except FileNotFoundError:
-                    pass
-                
-                # 上传
                 self.sftp.put(str(zip_file), remote_path)
                 self.results['uploaded'].append(zip_file.stem)
                 logger.info(f"    上传完成")
-                
             except Exception as e:
                 logger.error(f"    上传失败: {e}")
-        
+
         logger.info(f"上传完成: {len(self.results['uploaded'])} 个文件")
     
     # ==================== 步骤 3: 服务器端解压处理 ====================
@@ -733,11 +821,57 @@ if __name__ == "__main__":
                     # 如果没有报告文件，说明检查通过
                     logger.info(f"    ✓ 检查通过")
                     self.results['check_passed'].append(dir_name)
+                
+                # 获取关键帧数量
+                keyframe_count = self._get_keyframe_count_remote(remote_dir)
+                if keyframe_count > 0:
+                    with self.keyframe_counts_lock:
+                        self.keyframe_counts[dir_name] = keyframe_count
+                    logger.info(f"    📊 关键帧数量: {keyframe_count}")
             else:
                 logger.error(f"    检查失败: {err}")
                 self.results['check_failed'].append(dir_name)
         
         logger.info(f"检查完成: 通过 {len(self.results['check_passed'])}, 失败 {len(self.results['check_failed'])}")
+    
+    def _get_keyframe_count_remote(self, remote_dir: str) -> int:
+        """从远程服务器获取关键帧数量 (读取 sample.json)"""
+        try:
+            # 查找 sample.json 文件
+            sample_paths = [
+                f"{remote_dir}/sample.json",
+                f"{remote_dir}/undistorted/sample.json",
+            ]
+            
+            for sample_path in sample_paths:
+                status, out, _ = self._exec_remote(f"test -f '{sample_path}' && cat '{sample_path}' | python3 -c 'import json,sys; data=json.load(sys.stdin); print(len(data))'")
+                if status == 0 and out.strip().isdigit():
+                    return int(out.strip())
+            
+            return 0
+        except Exception as e:
+            logger.debug(f"获取关键帧数量失败: {e}")
+            return 0
+    
+    def _get_keyframe_count_remote_threaded(self, ssh, remote_dir: str) -> int:
+        """线程安全版本：从远程服务器获取关键帧数量 (读取 sample.json)"""
+        try:
+            sample_paths = [
+                f"{remote_dir}/sample.json",
+                f"{remote_dir}/undistorted/sample.json",
+            ]
+            
+            for sample_path in sample_paths:
+                status, out, _ = self._exec_remote_thread(
+                    ssh, 
+                    f"test -f '{sample_path}' && cat '{sample_path}' | python3 -c 'import json,sys; data=json.load(sys.stdin); print(len(data))'"
+                )
+                if status == 0 and out.strip().isdigit():
+                    return int(out.strip())
+            
+            return 0
+        except Exception as e:
+            return 0
     
     def _deploy_checker_script(self):
         """部署检查脚本到服务器"""
@@ -1327,6 +1461,13 @@ if __name__ == "__main__":
                     logger.info(f"  [检查] ✓ 检查通过")
                     self.results['check_passed'].append(stem)
                     
+                    # 获取关键帧数量
+                    keyframe_count = self._get_keyframe_count_remote(remote_data_dir)
+                    if keyframe_count > 0:
+                        with self.keyframe_counts_lock:
+                            self.keyframe_counts[stem] = keyframe_count
+                        logger.info(f"  [统计] 📊 关键帧数量: {keyframe_count}")
+                    
                     # ===== 步骤 5: 移动到最终目录 =====
                     logger.info(f"  [移动] 正在移动到最终目录...")
                     src = f"{SERVER_PROCESS_DIR}/{stem}"
@@ -1356,6 +1497,9 @@ if __name__ == "__main__":
                     self._log_error(stem, "检查", f"检查未通过")
                 
                 logger.info(f"  → 文件处理完成")
+            
+            # 更新飞书表格追踪
+            self._update_feishu_tracking()
         
         finally:
             self._close_server()
@@ -1492,6 +1636,9 @@ if __name__ == "__main__":
             
             # 显示汇总
             progress.summary()
+            
+            # 更新飞书表格追踪
+            self._update_feishu_tracking()
         
         finally:
             self._close_server()
@@ -1657,6 +1804,12 @@ if __name__ == "__main__":
             if check_passed:
                 with results_lock:
                     self.results['check_passed'].append(stem)
+                
+                # 获取关键帧数量
+                keyframe_count = self._get_keyframe_count_remote_threaded(ssh, remote_data_dir)
+                if keyframe_count > 0:
+                    with self.keyframe_counts_lock:
+                        self.keyframe_counts[stem] = keyframe_count
                 
                 # ===== 步骤 5: 移动 =====
                 src = f"{SERVER_PROCESS_DIR}/{stem}"
@@ -1845,6 +1998,9 @@ if __name__ == "__main__":
             if 'move' in steps:
                 self.step5_move_to_final()
             
+            # 更新飞书表格追踪
+            self._update_feishu_tracking()
+            
         finally:
             self._close_server()
         
@@ -1867,6 +2023,11 @@ if __name__ == "__main__":
             ("✗ 检查失败", len(self.results['check_failed'])),
             ("📁 已移动", len(self.results['moved_to_final'])),
         ]
+        
+        # 添加关键帧统计
+        total_keyframes = sum(self.keyframe_counts.values())
+        if total_keyframes > 0:
+            stats.append(("📊 总关键帧", total_keyframes))
         
         for label, count in stats:
             line = f"║  {label}: {count}"
@@ -1894,6 +2055,24 @@ if __name__ == "__main__":
                     display_msg = msg[:80] + "..." if len(msg) > 80 else msg
                     print(f"    │  [{step}] {display_msg}")
                 print(f"    └─")
+        
+        # 显示飞书追踪结果
+        if self.feishu_result:
+            print()
+            attrs = self.feishu_result.get('attributes', [])
+            created = len(self.feishu_result.get('created', []))
+            updated = len(self.feishu_result.get('updated', []))
+            failed = len(self.feishu_result.get('failed', []))
+            total_keyframes = self.feishu_result.get('total_keyframes', 0)
+            
+            print(f"  🔗 飞书表格追踪:")
+            print(f"    • 检测属性: {', '.join(attrs) if attrs else '无'}")
+            print(f"    • 新增记录: {created}")
+            print(f"    • 更新记录: {updated}")
+            if total_keyframes > 0:
+                print(f"    • 总关键帧: {total_keyframes}")
+            if failed > 0:
+                print(f"    • 失败: {failed}")
 
 
 def main():

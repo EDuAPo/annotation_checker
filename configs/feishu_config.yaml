@@ -1,0 +1,80 @@
+# 飞书多维表格配置
+# ===================
+# 
+# 使用说明：
+# 1. 在飞书开放平台 (https://open.feishu.cn/) 创建应用
+# 2. 获取 App ID 和 App Secret
+# 3. 在应用中开启「多维表格」权限
+# 4. 将应用添加为表格的协作者 (具有编辑权限)
+# 5. 填写下方配置
+
+# 飞书开放平台应用凭证
+app_id: "cli_a9d497d5b7241cd2"
+app_secret: "QArpM0ArN6BqJwcv9g7BFPAIt5wN0boP"
+
+# 多维表格配置
+# 从表格链接获取: https://ai.feishu.cn/wiki/QrMxwkT9NiBBSRkQ4Vlc8mkSn3g
+wiki_token: "QrMxwkT9NiBBSRkQ4Vlc8mkSn3g"
+
+# 多维表格的 app_token (需要从表格页面获取)
+# 方法1: 打开多维表格，从 URL 中提取 (格式: https://*.feishu.cn/base/xxxxx)
+# 方法2: 如果是知识库中嵌入的表格，需要使用 API 获取
+app_token: "Dtwxbhj9nadqdysc2mvcvuF9nYe"
+
+# 数据表 ID (一个多维表格可以有多个数据表/Sheet)
+# 可以使用 --list-tables 命令获取
+table_id: "tbl6BJTT6QT1Iokt"
+
+# 字段映射 (字段名 -> 字段ID)
+# 首次使用 --list-fields 命令后会显示所有字段
+# 请确保表格中有以下字段 (列):
+#   - 名称: 文本类型，用于存储数据名称
+#   - 拉框: 复选框类型，表示拉框属性
+#   - 线段: 复选框类型，表示线段属性  
+#   - 贴边: 复选框类型，表示贴边属性
+#   - 盲区: 复选框类型，表示盲区属性
+#   - 关键帧数量: 数字类型，记录该数据包的关键帧数量
+#   - 更新时间: 文本/日期类型，记录最后更新时间
+field_mapping:
+  数据包名称: fldaZNUgEZ
+  标注情况: fldGsWXe8t
+  关键帧数: fldvyzrWBv
+  拉框属性: fldlciBmlq
+  线段属性: fldexkxyUt
+  贴边属性: fldP4J3gpj
+  盲区属性: fld6yDTNc4
+  上传nas: fldtt8M8si
+  上传A100/dataset/scenesnew: fldOw27qgJ
+  上传A100/dataset02/lines: fldq6i04Yu
+  更新时间: fldBF32bL5
+
+# 数据属性关键词配置
+# 用于从 json_dir 路径中自动识别数据属性
+# 例如路径 "/media/zgw/T7/1.6线拉框导出/盲区数据/" 会匹配 "拉框" 和 "盲区"
+attribute_keywords:
+  拉框:
+    - "拉框"
+    - "框标注"
+    - "box"
+    - "bbox"
+  线段:
+    - "线段"
+    - "line"
+    - "polyline"
+    - "划线"
+  贴边:
+    - "贴边"
+    - "edge"
+    - "边缘"
+    - "boundary"
+  盲区:
+    - "盲区"
+    - "blind"
+    - "遮挡"
+  关键帧:
+    - "关键帧"
+    - "keyframe"
+    - "key_frame"
+
+# 是否启用飞书追踪 (设为 false 可临时禁用)
+enabled: true
