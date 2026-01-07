@@ -34,4 +34,4 @@ visualization:
 
 batch_processing:
   sample_rate: 0.1                   # 抽样比例，用于批量检查
-  output_report_path: "./reports"
+  output_report_path: "reports/check_report.txt"

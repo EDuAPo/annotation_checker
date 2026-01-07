@@ -18,11 +18,22 @@ class CustomJsonLoader:
 
     def _preload_annotations(self):
         """If annotation path is a file, load it once."""
+        target_file = None
         if self.annotation_path.is_file():
+            target_file = self.annotation_path
+        elif self.annotation_path.is_dir():
+            # 尝试查找常见的合并标注文件
+            for name in ['annotations.json', 'labels.json', 'all_annotations.json']:
+                candidate = self.annotation_path / name
+                if candidate.exists():
+                    target_file = candidate
+                    break
+        
+        if target_file:
             try:
-                with open(self.annotation_path, 'r') as f:
+                with open(target_file, 'r') as f:
                     self.cached_data = json.load(f)
-                print(f"Loaded annotations from {self.annotation_path}")
+                print(f"Loaded annotations from {target_file}")
             except Exception as e:
                 print(f"Failed to preload annotations: {e}")
 
@@ -117,7 +128,13 @@ class CustomJsonLoader:
                 return list(set([obj.get('frame_id') for obj in data if 'frame_id' in obj]))
         else:
             # 文件夹模式
-            return [f.stem for f in self.annotation_path.glob('*.json')]
+            excluded_stems = {'sample', 'annotations', 'labels', 'sensor_config'}
+            frame_ids = []
+            for f in self.annotation_path.glob('*.json'):
+                if f.stem in excluded_stems or 'sensor_config' in f.stem:
+                    continue
+                frame_ids.append(f.stem)
+            return frame_ids
 
     def load_annotation(self, frame_id: str) -> List[Dict]:
         """加载指定帧的标注"""
