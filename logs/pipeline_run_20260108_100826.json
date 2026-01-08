@@ -1,0 +1,33 @@
+{
+  "run_id": "20260108_100826",
+  "start_time": "2026-01-08T10:08:26.926871",
+  "end_time": null,
+  "json_dir": "/tmp/test",
+  "mode": "test",
+  "total_files": 0,
+  "processed_files": 1,
+  "successful_files": 1,
+  "failed_files": 0,
+  "skipped_files": 0,
+  "total_keyframes": 0,
+  "processing_stats": {
+    "downloaded": 0,
+    "uploaded": 0,
+    "processed": 0,
+    "checked_passed": 0,
+    "checked_failed": 0,
+    "moved_to_final": 0
+  },
+  "performance": {
+    "total_duration_seconds": 0,
+    "avg_time_per_file_seconds": 0,
+    "files_per_minute": 0
+  },
+  "errors": [],
+  "file_details": [],
+  "system_info": {
+    "python_version": "3.10.12",
+    "platform": "linux",
+    "working_directory": "/home/zgw/projects/annotation_checker"
+  }
+}

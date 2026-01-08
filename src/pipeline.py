@@ -45,8 +45,8 @@ LOGIN_URL = f"{API_BASE_URL}/session/token"
 
 # DataWeave 登录凭据 (用于自动获取 Token)
 # 如果设置了用户名密码，会自动登录获取 Token
-DATAWEAVE_USERNAME = "dongshucai@126.com"  # 填写你的用户名
-DATAWEAVE_PASSWORD = "dongshucai"  # 填写你的密码
+DATAWEAVE_USERNAME = os.environ.get("DATAWEAVE_USERNAME", "dongshucai@126.com")  # 填写你的用户名
+DATAWEAVE_PASSWORD = os.environ.get("DATAWEAVE_PASSWORD", "dongshucai")  # 填写你的密码
 
 # 多个可能的路径模板 (按优先级顺序，会依次尝试直到找到文件)
 DATAWEAVE_PATH_TEMPLATES = [
@@ -58,7 +58,7 @@ DATAWEAVE_PATH_TEMPLATES = [
     "dataweave://my/TO_RERE/12-9/{filename}",
 ]
 # 备用 Token (如果自动登录失败，会使用此 Token)
-AUTH_TOKEN = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwic3ViIjoidjRCUWlhIiwiZXhwIjoxNzY3Njc3NDMzLCJuYmYiOjE3Njc2NzM4MzN9.F0C1ZkAQxr4uAGVBRIpIMXFJwHW9Ke1x-KshxLMgCs8"
+AUTH_TOKEN = os.environ.get("DATAWEAVE_AUTH_TOKEN", "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwic3ViIjoidjRCUWlhIiwiZXhwIjoxNzY3Njc3NDMzLCJuYmYiOjE3Njc2NzM4MzN9.F0C1ZkAQxr4uAGVBRIpIMXFJwHW9Ke1x-KshxLMgCs8")
 
 # 服务器配置
 SERVER_IP = "222.223.112.212"
@@ -74,7 +74,7 @@ SERVER_FINAL_DIR = "/data02/test"         # 检查通过后的最终目录
 ZIP_AFTER_PROCESS = "rename"
 
 # 本地临时目录 (用于下载 ZIP 和检查数据)
-LOCAL_TEMP_DIR = "/home/viper/projects/zipdatas/"
+LOCAL_TEMP_DIR = "/media/zgw/T7/pipeline_downzips/"
 
 # 是否将 JSON 重命名为 annotations.json
 RENAME_JSON = True
@@ -131,7 +131,6 @@ class ProgressTracker:
         bar = '━' * filled + '╸' + '─' * (width - filled - 1) if filled < width else '━' * width
         
         status = "✓" if success else "✗"
-        elapsed = (datetime.now() - self.start_time).seconds
         
         # 清除当前行并显示进度
         sys.stdout.write(f'\r\033[K')
@@ -243,14 +242,14 @@ class AnnotationPipeline:
         data_info = {}
         for name in all_names:
             # 根据检查结果设置标注情况
-            if name in self.results.get('check_passed', []):
-                annotation_status = ["已完成"]
+            if name in self.results.get('check_passed', []) or name in self.results.get('skipped_server_exists', []):
+                # 检查通过或服务器已存在的数据都标记为已完成
+                annotation_status = "已完成"
             elif name in self.results.get('check_failed', []):
-                annotation_status = ["检查不通过"]
-            elif name in self.results.get('skipped_server_exists', []):
-                annotation_status = ["跳过"]  # 跳过的数据标记为"跳过"
+                annotation_status = "检查不通过"
             else:
-                annotation_status = ["已完成"]  # 默认值，兼容旧数据
+                # 默认情况下，如果数据被处理过，标记为已完成
+                annotation_status = "已完成"
             
             info = {
                 "标注情况": annotation_status
@@ -331,7 +330,7 @@ class AnnotationPipeline:
                 header = f.read(4)
                 # ZIP 文件以 PK\x03\x04 开头
                 return header[:2] == b'PK'
-        except:
+        except (OSError, IOError):
             return False
     
     def _connect_server(self):
@@ -428,7 +427,7 @@ class AnnotationPipeline:
                                 logger.info("🔑 Token 刷新成功")
                             return self._token
                 
-                except Exception as e:
+                except Exception:
                     if attempt < 2:
                         time.sleep(1)
                         continue
@@ -912,7 +911,7 @@ if __name__ == "__main__":
                         logger.warning(f"    ✗ 发现 {issue_count} 个问题帧")
                         logger.warning(f"      报告已保存: {self.local_check_dir}/report_{dir_name}.txt")
                         self.results['check_failed'].append(dir_name)
-                except Exception as e:
+                except Exception:
                     # 如果没有报告文件，说明检查通过
                     logger.info(f"    ✓ 检查通过")
                     self.results['check_passed'].append(dir_name)
@@ -1222,7 +1221,7 @@ def main():
     
     try:
         frames_to_check.sort(key=lambda x: int(x[0]))
-    except:
+    except (ValueError, TypeError):
         frames_to_check.sort(key=lambda x: x[0])
     
     total_frames = len(frames_to_check)
@@ -1579,7 +1578,7 @@ if __name__ == "__main__":
                             # 检查通过，删除本地报告
                             if local_report.exists():
                                 local_report.unlink()
-                    except:
+                    except OSError:
                         pass  # 没有报告文件说明通过
                 else:
                     check_passed = False
@@ -1786,7 +1785,7 @@ if __name__ == "__main__":
                     try:
                         result = future.result()
                         progress.update(success=result, name=stem)
-                    except Exception as e:
+                    except Exception:
                         progress.update(success=False, name=f"{stem} (异常)")
             
             # 显示汇总
@@ -1891,7 +1890,7 @@ if __name__ == "__main__":
                             try:
                                 if sftp: sftp.close()
                                 if ssh: ssh.close()
-                            except: pass
+                            except Exception: pass
                             import time
                             time.sleep(2)
                             ssh, sftp = connect_ssh()
@@ -2067,7 +2066,7 @@ if __name__ == "__main__":
                     sftp.close()
                 if ssh:
                     ssh.close()
-            except:
+            except Exception:
                 pass
 
     def _download_single_zip(self, stem: str, zip_name: str, target_file: Path, headers: dict, 

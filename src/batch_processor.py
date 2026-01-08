@@ -1,8 +1,16 @@
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
-from .data_loader import CustomJsonLoader
-from .rules_checker import RuleChecker
+
+# 处理相对导入
+try:
+    from .data_loader import CustomJsonLoader
+    from .rules_checker import RuleChecker
+except ImportError:
+    # 如果相对导入失败，使用绝对导入
+    from data_loader import CustomJsonLoader
+    from rules_checker import RuleChecker
 
 class BatchProcessor:
     def __init__(self, config: Dict, data_dir: Path = None):
@@ -123,7 +131,7 @@ class BatchProcessor:
         # 排序frame_ids以保证报告顺序
         try:
             frame_ids.sort(key=lambda x: int(x))
-        except:
+        except (ValueError, TypeError):
             frame_ids.sort()
         
         # 构建帧ID到INS数据的映射
@@ -143,7 +151,7 @@ class BatchProcessor:
                 # 基础检查
                 obj_issues = self.rule_checker.check_object(obj)
                 
-                # 运动一致性检查
+                # 运动一致性检查和轨迹一致性检查
                 inst_id = obj.get('instance_token')
                 if inst_id and inst_id in tracks:
                     track = tracks[inst_id]
@@ -155,20 +163,26 @@ class BatchProcessor:
                             break
                     
                     if idx != -1:
-                        prev_obj = track[idx-1][1] if idx > 0 else None
-                        next_obj = track[idx+1][1] if idx < len(track)-1 else None
-                        
-                        # 获取前后帧的 INS 数据
-                        prev_fid = track[idx-1][0] if idx > 0 else None
-                        next_fid = track[idx+1][0] if idx < len(track)-1 else None
-                        prev_ins = frame_to_ins.get(prev_fid) if prev_fid else None
-                        next_ins = frame_to_ins.get(next_fid) if next_fid else None
-                        
+                        # 使用优化后的运动一致性检查
                         motion_issues = self.rule_checker.check_motion_alignment(
-                            obj, prev_obj, next_obj,
-                            curr_ins, prev_ins, next_ins
+                            obj, track, idx, frame_to_ins
                         )
                         obj_issues.extend(motion_issues)
+                        
+                        # 轨迹一致性检查 (只在轨迹足够长时进行)
+                        if len(track) >= 5:  # 至少5帧才进行轨迹一致性检查
+                            trajectory_issues = self.rule_checker.check_trajectory_consistency(
+                                track, frame_to_ins
+                            )
+                            # 轨迹问题只报告一次 (在当前对象上)
+                            if trajectory_issues and idx == len(track) // 2:  # 在轨迹中间报告
+                                obj_issues.extend([f"轨迹问题: {issue}" for issue in trajectory_issues])
+                        
+                        # 低速无人车专用检查
+                        low_speed_issues = self.rule_checker.check_low_speed_vehicle_rules(
+                            obj, track, idx, frame_to_ins
+                        )
+                        obj_issues.extend(low_speed_issues)
                 
                 if obj_issues:
                     frame_issues.append({
