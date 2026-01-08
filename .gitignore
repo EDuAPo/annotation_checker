@@ -104,3 +104,21 @@ venv.bak/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.tmp
+*.log
+local_report.txt
+reports/
+test_jsons/

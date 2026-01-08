@@ -74,7 +74,7 @@ SERVER_FINAL_DIR = "/data02/test"         # 检查通过后的最终目录
 ZIP_AFTER_PROCESS = "rename"
 
 # 本地临时目录 (用于下载 ZIP 和检查数据)
-LOCAL_TEMP_DIR = "/media/zgw/T7/test_pipeline_downzips/"
+LOCAL_TEMP_DIR = "/home/viper/projects/zipdatas/"
 
 # 是否将 JSON 重命名为 annotations.json
 RENAME_JSON = True
@@ -153,10 +153,14 @@ class ProgressTracker:
 class AnnotationPipeline:
     """标注数据处理流水线"""
     
-    def __init__(self, json_dir: str, local_zip_dir: str = None):
+    def __init__(self, json_dir: str, local_zip_dir: str = None, clear_feishu: bool = False):
         self.json_dir = Path(json_dir)
-        self.local_zip_dir = Path(local_zip_dir) if local_zip_dir else Path(LOCAL_TEMP_DIR) / "zips"
-        self.local_check_dir = Path(LOCAL_TEMP_DIR) / "check_data"
+        self.clear_feishu = clear_feishu  # 是否清空飞书表格后重新写入
+        
+        # 使用参数化的本地目录，如果没有提供则使用默认临时目录
+        base_dir = Path(local_zip_dir) if local_zip_dir else Path(LOCAL_TEMP_DIR)
+        self.local_zip_dir = base_dir / "zips"
+        self.local_check_dir = base_dir / "check_data"
         
         # 确保目录存在
         self.local_zip_dir.mkdir(parents=True, exist_ok=True)
@@ -229,15 +233,27 @@ class AnnotationPipeline:
         all_names.update(self.results.get('uploaded', []))
         all_names.update(self.results.get('processed', []))
         all_names.update(self.results.get('check_passed', []))
+        all_names.update(self.results.get('check_failed', []))  # 确保检查失败的数据也被记录
         all_names.update(self.results.get('moved_to_final', []))
+        all_names.update(self.results.get('skipped_server_exists', []))  # 添加跳过的数据
         if not all_names:
             logger.info("没有需要统计的数据")
             return
-        # 构建数据信息（包含关键帧数量）
+        # 构建数据信息（包含关键帧数量和标注情况）
         data_info = {}
         for name in all_names:
+            # 根据检查结果设置标注情况
+            if name in self.results.get('check_passed', []):
+                annotation_status = ["已完成"]
+            elif name in self.results.get('check_failed', []):
+                annotation_status = ["检查不通过"]
+            elif name in self.results.get('skipped_server_exists', []):
+                annotation_status = ["跳过"]  # 跳过的数据标记为"跳过"
+            else:
+                annotation_status = ["已完成"]  # 默认值，兼容旧数据
+            
             info = {
-                "标注情况": ["已完成"]  # 多选字段，需要列表
+                "标注情况": annotation_status
             }
             if name in self.keyframe_counts:
                 info["关键帧数"] = self.keyframe_counts[name]
@@ -260,10 +276,20 @@ class AnnotationPipeline:
             logger.info("没有需要更新到飞书的数据")
             return
         try:
+            # 如果指定了清空选项，先清空表格
+            if self.clear_feishu:
+                logger.info("🗑️ 正在清空飞书表格...")
+                if self.feishu_tracker.clear_table():
+                    logger.info("✓ 飞书表格已清空")
+                else:
+                    logger.warning("⚠ 飞书表格清空失败，继续更新")
+            
+            # 按名称排序确保顺序一致性
+            sorted_names = sorted(all_names)
             keyframes_msg = f"，包含 {len(data_info)} 个关键帧统计" if data_info else ""
-            logger.info(f"📊 正在更新飞书表格 ({len(all_names)} 条数据{keyframes_msg})...")
+            logger.info(f"📊 正在更新飞书表格 ({len(sorted_names)} 条数据{keyframes_msg})...")
             self.feishu_result = self.feishu_tracker.track_data(
-                list(all_names), 
+                sorted_names, 
                 str(self.json_dir),
                 data_info=data_info
             )
@@ -458,9 +484,42 @@ class AnnotationPipeline:
             
             logger.info(f"[{i+1}/{len(json_files)}] 处理: {stem}")
             
-            # 检查服务器上是否已存在 (统一比较原始文件名)
-            if zip_name in server_zip_originals:
-                logger.info(f"    服务器上已存在，跳过下载")
+            # 检查服务器上是否已存在 (使用模糊匹配，与_find_local_json保持一致)
+            should_skip = False
+            for server_zip in server_zip_originals:
+                # 精确匹配
+                if server_zip == zip_name:
+                    should_skip = True
+                    break
+                # 模糊匹配：如果服务器ZIP文件名包含JSON文件名，或反之
+                if stem in server_zip or server_zip.replace('.zip', '') in stem:
+                    should_skip = True
+                    break
+            
+            if should_skip:
+                logger.info(f"    服务器上已存在对应ZIP文件，跳过下载")
+                
+                # 尝试获取关键帧数量（从最终目录或处理目录）
+                keyframe_count = 0
+                # 首先尝试从最终目录获取
+                remote_final_dir = f"{SERVER_FINAL_DIR}/{stem}"
+                keyframe_count = self._get_keyframe_count_remote(remote_final_dir)
+                if keyframe_count > 0:
+                    logger.info(f"    从最终目录获取到 {keyframe_count} 个关键帧")
+                else:
+                    # 如果最终目录没有，尝试处理目录
+                    remote_process_dir = f"{SERVER_PROCESS_DIR}/{stem}"
+                    keyframe_count = self._get_keyframe_count_remote(remote_process_dir)
+                    if keyframe_count > 0:
+                        logger.info(f"    从处理目录获取到 {keyframe_count} 个关键帧")
+                    else:
+                        logger.info(f"    未找到关键帧信息")
+                
+                # 记录关键帧数量
+                if keyframe_count > 0:
+                    with self.keyframe_counts_lock:
+                        self.keyframe_counts[stem] = keyframe_count
+                
                 self.results['skipped_server_exists'].append(stem)
                 continue
             
@@ -555,18 +614,40 @@ class AnnotationPipeline:
             logger.warning("没有找到 ZIP 文件需要上传")
             return
 
+        # 获取服务器上已存在的 ZIP 文件信息
+        remote_files = {}
+        try:
+            # 批量获取服务器上所有 ZIP 文件的信息
+            status, out, err = self._exec_remote(f"ls -la {SERVER_ZIP_DIR}/*.zip 2>/dev/null || true")
+            if status == 0 and out.strip():
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 9:
+                        try:
+                            file_size = int(parts[4])
+                            file_name = parts[8].split('/')[-1]
+                            if file_name.endswith('.zip'):
+                                remote_files[file_name] = file_size
+                        except (ValueError, IndexError):
+                            continue
+            elif status != 0:
+                logger.warning(f"获取服务器文件列表失败 (status={status}): {err}")
+        except Exception as e:
+            logger.warning(f"获取服务器文件列表异常: {e}")
+
         # 过滤掉服务器已存在的 zip 文件
         files_to_upload = []
         for zip_file in zip_files:
-            remote_path = f"{SERVER_ZIP_DIR}/{zip_file.name}"
-            try:
-                remote_stat = self.sftp.stat(remote_path)
-                if remote_stat.st_size == zip_file.stat().st_size:
-                    logger.info(f"远程已存在: {zip_file.name}，跳过上传")
+            file_name = zip_file.name
+            local_size = zip_file.stat().st_size
+            
+            if file_name in remote_files:
+                remote_size = remote_files[file_name]
+                if remote_size == local_size:
+                    logger.info(f"远程已存在: {file_name}，跳过上传")
                     self.results['uploaded'].append(zip_file.stem)
                     continue
-            except FileNotFoundError:
-                pass
+            
             files_to_upload.append(zip_file)
 
         if not files_to_upload:
@@ -836,7 +917,7 @@ if __name__ == "__main__":
                     logger.info(f"    ✓ 检查通过")
                     self.results['check_passed'].append(dir_name)
                 
-                # 获取关键帧数量
+                # 获取关键帧数量（所有处理完成的数据都要统计）
                 keyframe_count = self._get_keyframe_count_remote(remote_dir)
                 if keyframe_count > 0:
                     with self.keyframe_counts_lock:
@@ -845,6 +926,13 @@ if __name__ == "__main__":
             else:
                 logger.error(f"    检查失败: {err}")
                 self.results['check_failed'].append(dir_name)
+                
+                # 即使检查失败也要获取关键帧数量
+                keyframe_count = self._get_keyframe_count_remote(remote_dir)
+                if keyframe_count > 0:
+                    with self.keyframe_counts_lock:
+                        self.keyframe_counts[dir_name] = keyframe_count
+                    logger.info(f"    📊 关键帧数量: {keyframe_count}")
         
         logger.info(f"检查完成: 通过 {len(self.results['check_passed'])}, 失败 {len(self.results['check_failed'])}")
     
@@ -858,34 +946,51 @@ if __name__ == "__main__":
             ]
             
             for sample_path in sample_paths:
-                status, out, _ = self._exec_remote(f"test -f '{sample_path}' && cat '{sample_path}' | python3 -c 'import json,sys; data=json.load(sys.stdin); print(len(data))'")
-                if status == 0 and out.strip().isdigit():
-                    return int(out.strip())
+                # 更简单可靠的方法：先检查文件存在，然后读取并计数
+                status, out, _ = self._exec_remote(f"test -f '{sample_path}' && echo 'exists'")
+                logger.debug(f"文件存在检查: {sample_path} -> status={status}, out='{out}'")
+                if status == 0 and 'exists' in out:
+                    # 文件存在，尝试读取
+                    status, out, _ = self._exec_remote(f"python3 -c \"import json; print(len(json.load(open('{sample_path}'))))\"")
+                    if status == 0 and out.strip().isdigit():
+                        count = int(out.strip())
+                        logger.debug(f"从 {sample_path} 获取到 {count} 个关键帧")
+                        return count
             
             return 0
         except Exception as e:
             logger.debug(f"获取关键帧数量失败: {e}")
             return 0
     
-    def _get_keyframe_count_remote_threaded(self, ssh, remote_dir: str) -> int:
-        """线程安全版本：从远程服务器获取关键帧数量 (读取 sample.json)"""
-        try:
-            sample_paths = [
-                f"{remote_dir}/sample.json",
-                f"{remote_dir}/undistorted/sample.json",
-            ]
-            
-            for sample_path in sample_paths:
-                status, out, _ = self._exec_remote_thread(
-                    ssh, 
-                    f"test -f '{sample_path}' && cat '{sample_path}' | python3 -c 'import json,sys; data=json.load(sys.stdin); print(len(data))'"
-                )
-                if status == 0 and out.strip().isdigit():
-                    return int(out.strip())
-            
-            return 0
-        except Exception as e:
-            return 0
+    def _get_keyframe_count_remote_threaded(self, ssh, remote_dir: str, max_retries: int = 2) -> int:
+        """线程安全版本：从远程服务器获取关键帧数量 (读取 sample.json)，支持重试"""
+        for attempt in range(max_retries + 1):
+            try:
+                sample_paths = [
+                    f"{remote_dir}/sample.json",
+                    f"{remote_dir}/undistorted/sample.json",
+                ]
+                
+                for sample_path in sample_paths:
+                    # 更简单可靠的方法：先检查文件存在，然后读取并计数
+                    status, out, _ = self._exec_remote_thread(ssh, f"test -f '{sample_path}' && echo 'exists'")
+                    if status == 0 and 'exists' in out:
+                        # 文件存在，尝试读取
+                        status, out, _ = self._exec_remote_thread(ssh, f"python3 -c \"import json; print(len(json.load(open('{sample_path}')))\" 2>/dev/null")
+                        if status == 0 and out.strip().isdigit():
+                            count = int(out.strip())
+                            logger.debug(f"从 {sample_path} 获取到 {count} 个关键帧")
+                            return count
+                
+                return 0
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.debug(f"获取关键帧数量失败 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
+                    import time
+                    time.sleep(0.5 * (attempt + 1))  # 递增延迟
+                    continue
+                logger.debug(f"获取关键帧数量最终失败: {e}")
+                return 0
     
     def _deploy_checker_script(self):
         """部署检查脚本到服务器"""
@@ -1373,6 +1478,15 @@ if __name__ == "__main__":
                 if stem in processed_dirs:
                     logger.info(f"  → 已处理完成，跳过")
                     self.results['check_passed'].append(stem)
+                    
+                    # 获取关键帧数量（跳过的数据也要统计）
+                    remote_data_dir = f"{SERVER_FINAL_DIR}/{stem}"
+                    keyframe_count = self._get_keyframe_count_remote(remote_data_dir)
+                    if keyframe_count > 0:
+                        with self.keyframe_counts_lock:
+                            self.keyframe_counts[stem] = keyframe_count
+                        logger.info(f"  [统计] 📊 关键帧数量: {keyframe_count}")
+                    
                     continue
                 
                 # ===== 步骤 1: 下载或检查 =====
@@ -1509,6 +1623,13 @@ if __name__ == "__main__":
                 else:
                     self.results['check_failed'].append(stem)
                     self._log_error(stem, "检查", f"检查未通过")
+                    
+                    # 即使检查失败，也获取关键帧数量
+                    keyframe_count = self._get_keyframe_count_remote(remote_data_dir)
+                    if keyframe_count > 0:
+                        with self.keyframe_counts_lock:
+                            self.keyframe_counts[stem] = keyframe_count
+                        logger.info(f"  [统计] 📊 关键帧数量: {keyframe_count}")
                 
                 logger.info(f"  → 文件处理完成")
             
@@ -1595,6 +1716,21 @@ if __name__ == "__main__":
             # 自动获取 Token
             auth_token = self._get_dataweave_token()
             
+            # 在关闭主连接之前，先为跳过的文件获取关键帧数量
+            skipped_files_keyframes = {}
+            for json_file in json_files:
+                stem = json_file.stem
+                if stem in processed_dirs:
+                    remote_data_dir = f"{SERVER_FINAL_DIR}/{stem}"
+                    logger.info(f"  [调试] 尝试从 {remote_data_dir} 获取关键帧数量")
+                    keyframe_count = self._get_keyframe_count_remote(remote_data_dir)
+                    logger.info(f"  [统计] 📊 跳过文件 {stem} 关键帧数量: {keyframe_count} (目录: {remote_data_dir})")
+                    if keyframe_count > 0:
+                        skipped_files_keyframes[stem] = keyframe_count
+                        logger.info(f"  [统计] 📊 关键帧数量: {keyframe_count}")
+                    else:
+                        logger.warning(f"  [警告] 跳过文件 {stem} 未能获取关键帧数量 (目录: {remote_data_dir})")
+            
             # 关闭主连接，让每个线程创建自己的连接
             self._close_server()
             
@@ -1607,6 +1743,11 @@ if __name__ == "__main__":
                     skipped_count += 1
                     with results_lock:
                         self.results['check_passed'].append(stem)
+                    
+                    # 从预先获取的关键帧数量中设置
+                    if stem in skipped_files_keyframes:
+                        with self.keyframe_counts_lock:
+                            self.keyframe_counts[stem] = skipped_files_keyframes[stem]
                 else:
                     files_to_process.append((i, json_file, stem))
             
@@ -1729,6 +1870,9 @@ if __name__ == "__main__":
                 downloaded = self._download_single_zip(stem, zip_name, local_zip, headers)
                 if not downloaded:
                     self._log_error(stem, "下载", "下载失败，文件在DataWeave中不存在或网络问题")
+                    # 将下载失败的文件添加到结果中，以便统计
+                    with results_lock:
+                        self.results['check_failed'].append(stem)
                     return False
                 with results_lock:
                     self.results['downloaded'].append(stem)
@@ -1758,6 +1902,9 @@ if __name__ == "__main__":
                             return False
                 if not upload_ok:
                     self._log_error(stem, "上传", "上传失败，无法建立连接")
+                    # 将上传失败的文件添加到结果中，以便统计
+                    with results_lock:
+                        self.results['check_failed'].append(stem)
                     return False
                 with results_lock:
                     self.results['uploaded'].append(stem)
@@ -1768,6 +1915,9 @@ if __name__ == "__main__":
                 sftp.put(str(json_file), remote_json_temp)
             except Exception as e:
                 self._log_error(stem, "上传JSON", f"上传JSON文件失败: {e}")
+                # 将JSON上传失败的文件添加到结果中，以便统计
+                with results_lock:
+                    self.results['check_failed'].append(stem)
                 return False
             
             cmd = f"python3 /tmp/zip_worker.py --zip '{remote_zip}' --json '{remote_json_temp}' --out '{SERVER_PROCESS_DIR}' --rename_json '{RENAME_JSON}'"
@@ -1775,6 +1925,48 @@ if __name__ == "__main__":
             
             if status != 0:
                 self._log_error(stem, "服务器处理", f"处理脚本返回错误码 {status}: {err_output[:200]}")
+                
+                # 即使处理失败，也尝试获取关键帧数量
+                # 优先从最终目录获取（如果已存在），其次从处理目录获取
+                keyframe_count = 0
+                remote_data_dir = f"{SERVER_PROCESS_DIR}/{stem}"
+                
+                # 首先尝试从最终目录获取（可能之前已处理成功）
+                final_dir = f"{SERVER_FINAL_DIR}/{stem}"
+                temp_count = self._get_keyframe_count_remote_threaded(ssh, final_dir)
+                if temp_count > 0:
+                    keyframe_count = temp_count
+                    logger.info(f"  [统计] 📊 从最终目录获取关键帧数量: {keyframe_count} (目录: {final_dir})")
+                else:
+                    # 尝试从处理目录获取（如果部分解压）
+                    temp_count = self._get_keyframe_count_remote_threaded(ssh, remote_data_dir)
+                    if temp_count > 0:
+                        keyframe_count = temp_count
+                        logger.info(f"  [统计] 📊 从处理目录获取关键帧数量: {keyframe_count} (目录: {remote_data_dir})")
+                    else:
+                        # 从本地JSON文件获取帧数量
+                        try:
+                            import json
+                            json_path = json_file
+                            with open(json_path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                            temp_count = len(data)
+                            if temp_count > 0:
+                                keyframe_count = temp_count
+                                logger.info(f"  [统计] 📊 从本地JSON获取关键帧数量: {keyframe_count} (文件: {json_path.name})")
+                        except Exception as e:
+                            logger.debug(f"从本地JSON获取关键帧数量失败: {e}")
+                
+                if keyframe_count > 0:
+                    with self.keyframe_counts_lock:
+                        self.keyframe_counts[stem] = keyframe_count
+                else:
+                    logger.warning(f"  [警告] 处理失败文件 {stem} 未能获取关键帧数量")
+                
+                # 将处理失败的文件添加到结果中，以便统计
+                with results_lock:
+                    self.results['check_failed'].append(stem)
+                
                 return False
             
             # 处理原始 ZIP
@@ -1819,11 +2011,14 @@ if __name__ == "__main__":
                 with results_lock:
                     self.results['check_passed'].append(stem)
                 
-                # 获取关键帧数量
+                # 获取关键帧数量（在移动之前，从processing目录获取）
                 keyframe_count = self._get_keyframe_count_remote_threaded(ssh, remote_data_dir)
                 if keyframe_count > 0:
                     with self.keyframe_counts_lock:
                         self.keyframe_counts[stem] = keyframe_count
+                    logger.info(f"  [统计] 📊 关键帧数量: {keyframe_count}")
+                else:
+                    logger.warning(f"  [警告] 检查完成文件 {stem} 未能获取关键帧数量 (目录: {remote_data_dir})")
                 
                 # ===== 步骤 5: 移动 =====
                 src = f"{SERVER_PROCESS_DIR}/{stem}"
@@ -1844,11 +2039,21 @@ if __name__ == "__main__":
                     # 流水线成功完成，删除本地 ZIP 文件
                     if local_zip.exists():
                         local_zip.unlink()
+                        logger.info(f"  [清理] 已删除本地 ZIP: {local_zip.name}")
                 else:
                     self._log_error(stem, "移动", f"移动到最终目录失败: {move_err}")
             else:
                 with results_lock:
                     self.results['check_failed'].append(stem)
+                
+                # 检查失败的数据也获取关键帧数量
+                keyframe_count = self._get_keyframe_count_remote_threaded(ssh, remote_data_dir)
+                if keyframe_count > 0:
+                    with self.keyframe_counts_lock:
+                        self.keyframe_counts[stem] = keyframe_count
+                    logger.info(f"  [统计] 📊 关键帧数量: {keyframe_count}")
+                else:
+                    logger.warning(f"  [警告] 检查失败文件 {stem} 未能获取关键帧数量 (目录: {remote_data_dir})")
             
             return check_passed
             
@@ -2015,11 +2220,46 @@ if __name__ == "__main__":
             # 更新飞书表格追踪
             self._update_feishu_tracking()
             
+            # 注意：本地ZIP文件已在每个数据处理完成后单独清理，无需统一清理
+            
         finally:
             self._close_server()
         
         # 输出汇总
         self._print_summary()
+    
+    def _cleanup_passed_data(self):
+        """清理检查通过的数据的本地临时文件"""
+        if not self.results.get('check_passed'):
+            logger.info("没有检查通过的数据，无需清理本地临时文件")
+            return
+        
+        logger.info("🧹 正在清理检查通过的数据的本地临时文件...")
+        
+        cleaned_count = 0
+        for data_name in self.results['check_passed']:
+            try:
+                # 清理本地ZIP文件
+                zip_file = self.local_zip_dir / f"{data_name}.zip"
+                if zip_file.exists():
+                    zip_file.unlink()
+                    logger.debug(f"  已删除本地ZIP: {zip_file.name}")
+                    cleaned_count += 1
+                
+                # 清理本地检查报告
+                report_file = self.local_check_dir / f"report_{data_name}.txt"
+                if report_file.exists():
+                    report_file.unlink()
+                    logger.debug(f"  已删除检查报告: {report_file.name}")
+                    cleaned_count += 1
+                    
+            except Exception as e:
+                logger.warning(f"  清理 {data_name} 失败: {e}")
+        
+        if cleaned_count > 0:
+            logger.info(f"✓ 已清理 {cleaned_count} 个本地临时文件")
+        else:
+            logger.info("没有找到需要清理的本地临时文件")
     
     def _print_summary(self):
         """打印执行汇总"""
@@ -2103,8 +2343,10 @@ def main():
                         help='流式处理模式: 下载一个文件就立即处理，无需等待全部下载完成')
     parser.add_argument('--parallel', '-p', action='store_true',
                         help='多线程并行模式: 多个文件同时下载和处理 (推荐)')
-    parser.add_argument('--workers', '-w', type=int, default=None,
-                        help=f'并行线程数 (默认 {MAX_WORKERS})')
+    parser.add_argument('--workers', '-w', type=int, default=3,
+                        help='并行模式下的线程数 (默认: 3)')
+    parser.add_argument('--clear-feishu', action='store_true',
+                        help='清空飞书表格后重新写入所有数据 (从第一行开始)')
     
     args = parser.parse_args()
     
@@ -2112,7 +2354,7 @@ def main():
         logger.error(f"JSON 目录不存在: {args.json_dir}")
         return
     
-    pipeline = AnnotationPipeline(args.json_dir, args.zip_dir)
+    pipeline = AnnotationPipeline(args.json_dir, args.zip_dir, args.clear_feishu)
     
     if args.parallel:
         # 多线程并行模式

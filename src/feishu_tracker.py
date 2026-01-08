@@ -69,6 +69,7 @@ class FeishuTracker:
         self.field_mapping = self.config.get("field_mapping", {})
         # 字段名标准化映射（支持常用别名自动适配）
         self._field_alias = {
+            "序号": ["序号", "行号", "index", "order"],
             "名称": ["名称", "数据包名称", "name"],
             "关键帧数": ["关键帧数量", "关键帧数", "keyframe", "key_frame"],
             "标注情况": ["标注情况"],
@@ -85,6 +86,10 @@ class FeishuTracker:
         
         # API 基础 URL
         self.api_base = "https://open.feishu.cn/open-apis"
+    
+    def _get_beijing_timestamp(self) -> int:
+        """获取北京时间的时间戳 (UTC+8)，毫秒级"""
+        return int(time.time() * 1000) + 8 * 3600 * 1000
     
     def _load_config(self) -> dict:
         """加载配置文件"""
@@ -376,10 +381,10 @@ class FeishuTracker:
         name_field = self._get_field_name_by_alias("名称")
         if name_field:
             fields[name_field] = name
-        # 更新时间（必须为Unix时间戳）
+        # 更新时间（北京时间，Unix时间戳）
         update_field = self._get_field_name_by_alias("更新时间")
         if update_field:
-            fields[update_field] = int(time.time())
+            fields[update_field] = self._get_beijing_timestamp()
         # 属性复选框
         for attr in attributes:
             attr_field = self._get_field_name_by_alias(attr)
@@ -447,10 +452,10 @@ class FeishuTracker:
         
         # 构建更新数据
         fields = {}
-        # 更新时间（必须为Unix时间戳）
+        # 更新时间（北京时间，Unix时间戳）
         update_field = self._get_field_name_by_alias("更新时间")
         if update_field:
-            fields[update_field] = int(time.time())
+            fields[update_field] = self._get_beijing_timestamp()
         # 设置属性字段为勾选状态
         for attr in attributes:
             attr_field = self._get_field_name_by_alias(attr)
@@ -487,6 +492,7 @@ class FeishuTracker:
         追踪数据处理情况 (核心方法)
         
         根据 json_dir 路径检测数据属性，然后在表格中记录每个数据名称，并标记对应的属性列。
+        优化逻辑：按序号顺序填写，填补空行。
         
         Args:
             names: 数据名称列表 (通常是 ZIP 文件名或数据集名称)
@@ -517,10 +523,76 @@ class FeishuTracker:
         
         logger.info(f"开始更新飞书表格，共 {len(names)} 条数据，属性: {attributes}")
         
+        # 获取现有记录并分析序号分布
+        all_records = self._get_all_records(table_id or self.table_id)
+        existing_records = self._get_all_records_with_index(table_id or self.table_id)
+        used_indices = set(existing_records.keys())
+        
+        # 第一步：通过名称匹配找出已存在的记录
+        name_to_existing_record = {}  # {clean_name: (index, record)}
+        for record in all_records:  # 使用所有记录而不是序号索引的记录
+            record_fields = record.get("fields", {})
+            record_name = None
+            for field_name in self.field_mapping:
+                if field_name in ["名称", "数据包名称", "name", "Name"]:
+                    record_name = record_fields.get(field_name)
+                    break
+            
+            if record_name:
+                clean_record_name = str(record_name).replace(".zip", "").replace(".json", "")
+                # 获取记录的序号
+                record_index = None
+                for field_name in self.field_mapping:
+                    if field_name in ["序号", "行号", "index", "order"]:
+                        index_value = record_fields.get(field_name)
+                        if index_value is not None:
+                            try:
+                                record_index = int(index_value)
+                                break
+                            except (ValueError, TypeError):
+                                continue
+                name_to_existing_record[clean_record_name] = (record_index or 0, record)
+        
+        # 第二步：为所有数据分配序号
+        assigned_indices = {}  # {original_name: index}
+        available_indices = set()  # 未使用的序号
+        
+        # 找出所有未使用的序号
+        max_index = max(used_indices) if used_indices else 0
+        for i in range(1, max_index + 2):  # 多加一个作为缓冲
+            if i not in used_indices:
+                available_indices.add(i)
+        
         for name in names:
+            name_clean = name.replace(".zip", "").replace(".json", "")
+            
+            # 检查是否已有记录
+            if name_clean in name_to_existing_record:
+                # 使用现有记录的序号
+                existing_index, _ = name_to_existing_record[name_clean]
+                assigned_indices[name] = existing_index
+                logger.debug(f"数据 {name_clean} 使用现有序号: {existing_index}")
+            else:
+                # 分配新序号（优先使用小的未使用序号）
+                if available_indices:
+                    new_index = min(available_indices)
+                    available_indices.remove(new_index)
+                else:
+                    # 如果没有可用序号，使用最大序号+1
+                    new_index = max(used_indices) + 1 if used_indices else 1
+                    used_indices.add(new_index)
+                
+                assigned_indices[name] = new_index
+                used_indices.add(new_index)
+                logger.debug(f"数据 {name_clean} 分配新序号: {new_index}")
+        
+        # 按序号顺序处理
+        
+        # 按序号顺序处理
+        for name in sorted(assigned_indices.keys(), key=lambda x: assigned_indices[x]):
             try:
-                # 去掉 .zip 后缀
                 name_clean = name.replace(".zip", "").replace(".json", "")
+                index = assigned_indices[name]
                 
                 # 获取该数据的额外信息
                 extra_fields = data_info.get(name_clean, {}) or data_info.get(name, {})
@@ -529,14 +601,37 @@ class FeishuTracker:
                 if "关键帧数量" in extra_fields:
                     result["total_keyframes"] += extra_fields["关键帧数量"]
                 
-                # 搜索是否已存在
-                record = self.search_record(name_clean, table_id)
+                # 设置序号
+                extra_fields["序号"] = index
                 
-                if record:
+                # 检查是否已存在记录（通过名称匹配）
+                existing_record = None
+                if name_clean in name_to_existing_record:
+                    _, existing_record = name_to_existing_record[name_clean]
+                
+                if existing_record:
                     # 更新现有记录
-                    record_id = record.get("record_id")
-                    if self.update_record(record_id, attributes, table_id, extra_fields):
+                    record_id = existing_record.get("record_id")
+                    
+                    # 检查现有记录是否已经有关键帧数量，如果有则不重复写入
+                    existing_fields = existing_record.get("fields", {})
+                    keyframe_field_name = self._get_field_name_by_alias("关键帧数")
+                    has_keyframe = False
+                    if keyframe_field_name and existing_fields.get(keyframe_field_name):
+                        has_keyframe = True
+                        # 从extra_fields中移除关键帧字段，避免重复写入
+                        extra_fields_copy = extra_fields.copy()
+                        for key in list(extra_fields_copy.keys()):
+                            if key in ["关键帧数", "关键帧数量", "keyframe", "key_frame"]:
+                                del extra_fields_copy[key]
+                        logger.debug(f"记录 {name_clean} 已存在关键帧数量，跳过更新")
+                    else:
+                        extra_fields_copy = extra_fields
+                    
+                    if self.update_record(record_id, attributes, table_id, extra_fields_copy):
                         result["updated"].append(name_clean)
+                        if has_keyframe:
+                            result["updated"][-1] += " (关键帧已存在)"
                     else:
                         result["failed"].append(name_clean)
                 else:
@@ -558,7 +653,121 @@ class FeishuTracker:
         
         return result
     
-    def batch_create_records(self, records: List[dict], table_id: str = None) -> dict:
+    def clear_table(self, table_id: str = None) -> bool:
+        """
+        清空表格中的所有记录
+        
+        Args:
+            table_id: 数据表 ID
+            
+        Returns:
+            是否清空成功
+        """
+        table_id = table_id or self.table_id
+        if not self.app_token or not table_id:
+            logger.error("请在配置中设置 app_token 和 table_id")
+            return False
+        
+        try:
+            # 首先获取所有记录
+            records = self._get_all_records(table_id)
+            if not records:
+                logger.info("表格已经是空的")
+                return True
+            
+            # 批量删除记录
+            record_ids = [record['record_id'] for record in records]
+            return self._batch_delete_records(record_ids, table_id)
+            
+        except Exception as e:
+            logger.error(f"清空表格失败: {e}")
+            return False
+    
+    def _get_all_records(self, table_id: str) -> List[dict]:
+        """获取表格中的所有记录（支持分页）"""
+        all_records = []
+        page_token = None
+        page_size = 500
+        
+        while True:
+            url = f"{self.api_base}/bitable/v1/apps/{self.app_token}/tables/{table_id}/records"
+            params = {"page_size": page_size}
+            if page_token:
+                params["page_token"] = page_token
+            
+            try:
+                response = requests.get(url, headers=self._get_headers(), params=params, timeout=15)
+                data = response.json()
+                
+                if data.get("code") == 0:
+                    items = data.get("data", {}).get("items", [])
+                    all_records.extend(items)
+                    
+                    # 检查是否有下一页
+                    page_token = data.get("data", {}).get("page_token")
+                    if not page_token:
+                        break
+                else:
+                    logger.error(f"获取记录失败: {data}")
+                    break
+            except requests.RequestException as e:
+                logger.error(f"获取记录请求失败: {e}")
+                break
+        
+        return all_records
+    
+    def _get_all_records_with_index(self, table_id: str) -> Dict[int, dict]:
+        """获取表格中的所有记录，按序号索引"""
+        records = self._get_all_records(table_id)
+        indexed_records = {}
+        
+        for record in records:
+            fields = record.get("fields", {})
+            index = None
+            
+            # 查找序号字段
+            for field_name in self.field_mapping:
+                if field_name in ["序号", "行号", "index", "order"]:
+                    index_value = fields.get(field_name)
+                    if index_value is not None:
+                        try:
+                            index = int(index_value)
+                            break
+                        except (ValueError, TypeError):
+                            continue
+            
+            if index is not None:
+                indexed_records[index] = record
+        
+        return indexed_records
+    
+    def _batch_delete_records(self, record_ids: List[str], table_id: str) -> bool:
+        """批量删除记录"""
+        if not record_ids:
+            return True
+            
+        url = f"{self.api_base}/bitable/v1/apps/{self.app_token}/tables/{table_id}/records/batch_delete"
+        
+        # 分批删除，每批最多10条
+        batch_size = 10
+        for i in range(0, len(record_ids), batch_size):
+            batch_ids = record_ids[i:i + batch_size]
+            payload = {"records": batch_ids}
+            
+            try:
+                response = requests.post(url, headers=self._get_headers(), json=payload, timeout=10)
+                data = response.json()
+                
+                if data.get("code") != 0:
+                    logger.error(f"批量删除失败: {data}")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"批量删除请求失败: {e}")
+                return False
+        
+        logger.info(f"成功删除 {len(record_ids)} 条记录")
+        return True
         """
         批量创建记录
         
